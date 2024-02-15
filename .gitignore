@@ -128,3 +128,13 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+
+commands.sh
+commands copy.sh
+results copy
+results
+slurm
+slurm_out
+wandb
+results.csv

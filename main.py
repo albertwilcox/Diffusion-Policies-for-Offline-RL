@@ -7,12 +7,14 @@ import numpy as np
 import os
 import torch
 import json
+import sys
 
 import d4rl
 from utils import utils
 from utils.data_sampler import Data_Sampler
 from utils.logger import logger, setup_logger
-from torch.utils.tensorboard import SummaryWriter
+# from torch.utils.tensorboard import SummaryWriter
+import wandb
 
 hyperparameters = {
     'halfcheetah-medium-v2':         {'lr': 3e-4, 'eta': 1.0,   'max_q_backup': False,  'reward_tune': 'no',          'eval_freq': 50, 'num_epochs': 2000, 'gn': 9.0,  'top_k': 1},
@@ -70,27 +72,59 @@ def train_agent(env, state_dim, action_dim, max_action, device, output_dir, args
                       beta_schedule=args.beta_schedule,
                       n_timesteps=args.T,
                       lr=args.lr)
+        
+    if args.checkpoint is not None:
+        agent.load(args.checkpoint)
+        with open(os.path.join(args.checkpoint, 'state_data.json'), 'r') as f:
+            state_data = json.load(f)
+    else:
+        state_data = {
+            'training_iters': 0, 
+            'metric': 100,
+            'early_stop': False,
+            'evaluations': []
+        }
+    
+    if args.do_wandb:
+        if 'id' not in state_data:
+            id = wandb.util.generate_id()
+            state_data['id'] = id
+        wandb.init(
+            project='diffusion-ql-baseline',
+            config=variant,
+            name=wandb_name,
+            group=args.group,
+            save_code=True,
+            # monitor_gym=wandb_cfg.monitor_gym,
+            resume='allow',
+            id=state_data['id'],
+        )
 
-    early_stop = False
+    checkpoint_dir = os.path.join(output_dir, 'checkpoint')
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # early_stop = False
     stop_check = utils.EarlyStopping(tolerance=1, min_delta=0.)
     writer = None  # SummaryWriter(output_dir)
 
-    evaluations = []
-    training_iters = 0
+    # evaluations = []
+    # training_iters = 0
     max_timesteps = args.num_epochs * args.num_steps_per_epoch
-    metric = 100.
+    # metric = 100.
     utils.print_banner(f"Training Start", separator="*", num_star=90)
-    while (training_iters < max_timesteps) and (not early_stop):
+    while (state_data['training_iters'] < max_timesteps) and (not state_data['early_stop']):
         iterations = int(args.eval_freq * args.num_steps_per_epoch)
         loss_metric = agent.train(data_sampler,
+                                  step=state_data['training_iters'],
                                   iterations=iterations,
                                   batch_size=args.batch_size,
-                                  log_writer=writer)
-        training_iters += iterations
-        curr_epoch = int(training_iters // int(args.num_steps_per_epoch))
+                                  log_writer=writer,
+                                  do_wandb=args.do_wandb)
+        state_data['training_iters'] += iterations
+        curr_epoch = int(state_data['training_iters'] // int(args.num_steps_per_epoch))
 
         # Logging
-        utils.print_banner(f"Train step: {training_iters}", separator="*", num_star=90)
+        utils.print_banner(f"Train step: {state_data['training_iters']}", separator="*", num_star=90)
         logger.record_tabular('Trained Epochs', curr_epoch)
         logger.record_tabular('BC Loss', np.mean(loss_metric['bc_loss']))
         logger.record_tabular('QL Loss', np.mean(loss_metric['ql_loss']))
@@ -101,26 +135,38 @@ def train_agent(env, state_dim, action_dim, max_action, device, output_dir, args
         # Evaluation
         eval_res, eval_res_std, eval_norm_res, eval_norm_res_std = eval_policy(agent, args.env_name, args.seed,
                                                                                eval_episodes=args.eval_episodes)
-        evaluations.append([eval_res, eval_res_std, eval_norm_res, eval_norm_res_std,
+        state_data['evaluations'].append([eval_res, eval_res_std, eval_norm_res, eval_norm_res_std,
                             np.mean(loss_metric['bc_loss']), np.mean(loss_metric['ql_loss']),
                             np.mean(loss_metric['actor_loss']), np.mean(loss_metric['critic_loss']),
                             curr_epoch])
-        np.save(os.path.join(output_dir, "eval"), evaluations)
+        np.save(os.path.join(output_dir, "eval"), state_data['evaluations'])
+
+        agent.save(checkpoint_dir)
+        with open(os.path.join(checkpoint_dir, 'state_data.json'), 'w') as f:
+            json.dump(state_data, f)
+
         logger.record_tabular('Average Episodic Reward', eval_res)
         logger.record_tabular('Average Episodic N-Reward', eval_norm_res)
         logger.dump_tabular()
+        if args.do_wandb:
+            wandb.log({
+                'eval_rewards': eval_res,
+                'eval_rewards_std': eval_res_std,
+                'eval_norm_rewards': eval_norm_res,
+                'eval_norm_rewards_std': eval_norm_res_std,
+            }, step=state_data['training_iters'])
 
         bc_loss = np.mean(loss_metric['bc_loss'])
         if args.early_stop:
-            early_stop = stop_check(metric, bc_loss)
+            state_data['early_stop'] = stop_check(state_data['metric'], bc_loss)
 
-        metric = bc_loss
+        state_data['metric'] = bc_loss
 
         if args.save_best_model:
             agent.save_model(output_dir, curr_epoch)
 
     # Model Selection: online or offline
-    scores = np.array(evaluations)
+    scores = np.array(state_data['evaluations'])
     if args.ms == 'online':
         best_id = np.argmax(scores[:, 2])
         best_res = {'model selection': args.ms, 'epoch': scores[best_id, -1],
@@ -177,10 +223,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     ### Experimental Setups ###
     parser.add_argument("--exp", default='exp_1', type=str)                    # Experiment ID
+    parser.add_argument('--group', default=None)
     parser.add_argument('--device', default=0, type=int)                       # device, {"cpu", "cuda", "cuda:0", "cuda:1"}, etc
     parser.add_argument("--env_name", default="walker2d-medium-expert-v2", type=str)  # OpenAI gym environment name
     parser.add_argument("--dir", default="results", type=str)                    # Logging directory
-    parser.add_argument("--seed", default=0, type=int)                         # Sets Gym, PyTorch and Numpy seeds
+    parser.add_argument("--seed", default=42, type=int)                         # Sets Gym, PyTorch and Numpy seeds
     parser.add_argument("--num_steps_per_epoch", default=1000, type=int)
 
     ### Optimization Setups ###
@@ -199,6 +246,9 @@ if __name__ == "__main__":
     ### Algo Choice ###
     parser.add_argument("--algo", default="ql", type=str)  # ['bc', 'ql']
     parser.add_argument("--ms", default='offline', type=str, help="['online', 'offline']")
+    parser.add_argument('--do_wandb', action='store_true')
+    parser.add_argument('--checkpoint')
+    parser.add_argument('--auto_resume', action='store_true')
     # parser.add_argument("--top_k", default=1, type=int)
 
     # parser.add_argument("--lr", default=3e-4, type=float)
@@ -223,12 +273,14 @@ if __name__ == "__main__":
     args.top_k = hyperparameters[args.env_name]['top_k']
 
     # Setup Logging
-    file_name = f"{args.env_name}|{args.exp}|diffusion-{args.algo}|T-{args.T}"
-    if args.lr_decay: file_name += '|lr_decay'
-    file_name += f'|ms-{args.ms}'
+    file_name = f"{args.env_name}/diffusion-{args.algo}/{args.exp}"
+    if args.group is not None:
+        file_name += f"/{args.group}"
+    file_name += f"/{args.seed}"
 
-    if args.ms == 'offline': file_name += f'|k-{args.top_k}'
-    file_name += f'|{args.seed}'
+    wandb_name = file_name.replace('/', '_')
+
+
 
     results_dir = os.path.join(args.output_dir, file_name)
     if not os.path.exists(results_dir):
@@ -236,6 +288,13 @@ if __name__ == "__main__":
     utils.print_banner(f"Saving location: {results_dir}")
     # if os.path.exists(os.path.join(results_dir, 'variant.json')):
     #     raise AssertionError("Experiment under this setting has been done!")
+    
+    if args.auto_resume:
+        if 'best_score_offline.txt' in os.listdir(results_dir):
+            print('This run stopped early. exiting')
+            sys.exit()
+        args.checkpoint = os.path.join(results_dir, 'checkpoint')
+
     variant = vars(args)
     variant.update(version=f"Diffusion-Policies-RL")
 

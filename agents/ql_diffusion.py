@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import os
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from utils.logger import logger
+import wandb
 
 from agents.diffusion import Diffusion
 from agents.model import MLP
@@ -76,7 +78,7 @@ class Diffusion_QL(object):
         self.lr_decay = lr_decay
         self.grad_norm = grad_norm
 
-        self.step = 0
+        # self.step = 0
         self.step_start_ema = step_start_ema
         self.ema = EMA(ema_decay)
         self.ema_model = copy.deepcopy(self.actor)
@@ -99,14 +101,14 @@ class Diffusion_QL(object):
         self.device = device
         self.max_q_backup = max_q_backup
 
-    def step_ema(self):
-        if self.step < self.step_start_ema:
+    def step_ema(self, step):
+        if step < self.step_start_ema:
             return
         self.ema.update_model_average(self.ema_model, self.actor)
 
-    def train(self, replay_buffer, iterations, batch_size=100, log_writer=None):
+    def train(self, replay_buffer, iterations, step, batch_size=100, log_writer=None, do_wandb=False):
 
-        metric = {'bc_loss': [], 'ql_loss': [], 'actor_loss': [], 'critic_loss': []}
+        metric = {'bc_loss': [], 'ql_loss': [], 'actor_loss': [], 'critic_loss': [], 'target_q': []}
         for _ in range(iterations):
             # Sample replay buffer / batch
             state, action, next_state, reward, not_done = replay_buffer.sample(batch_size)
@@ -155,29 +157,42 @@ class Diffusion_QL(object):
 
 
             """ Step Target network """
-            if self.step % self.update_ema_every == 0:
-                self.step_ema()
+            if step % self.update_ema_every == 0:
+                self.step_ema(step)
 
             for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-            self.step += 1
+            step += 1
 
             """ Log """
             if log_writer is not None:
                 if self.grad_norm > 0:
-                    log_writer.add_scalar('Actor Grad Norm', actor_grad_norms.max().item(), self.step)
-                    log_writer.add_scalar('Critic Grad Norm', critic_grad_norms.max().item(), self.step)
-                log_writer.add_scalar('BC Loss', bc_loss.item(), self.step)
-                log_writer.add_scalar('QL Loss', q_loss.item(), self.step)
-                log_writer.add_scalar('Critic Loss', critic_loss.item(), self.step)
-                log_writer.add_scalar('Target_Q Mean', target_q.mean().item(), self.step)
+                    log_writer.add_scalar('Actor Grad Norm', actor_grad_norms.max().item(), step)
+                    log_writer.add_scalar('Critic Grad Norm', critic_grad_norms.max().item(), step)
+                log_writer.add_scalar('BC Loss', bc_loss.item(), step)
+                log_writer.add_scalar('QL Loss', q_loss.item(), step)
+                log_writer.add_scalar('Critic Loss', critic_loss.item(), step)
+                log_writer.add_scalar('Target_Q Mean', target_q.mean().item(), step)
 
             metric['actor_loss'].append(actor_loss.item())
             metric['bc_loss'].append(bc_loss.item())
             metric['ql_loss'].append(q_loss.item())
             metric['critic_loss'].append(critic_loss.item())
+            metric['target_q'].append(target_q.mean().item())
 
+        if do_wandb:
+            wandb.log({
+                'train/bc_loss': np.array(metric['bc_loss']).mean(),
+                'train/ql_loss': np.array(metric['ql_loss']).mean(),
+                'train/critic_loss': np.array(metric['critic_loss']).mean(),
+                'train/target_q_mean': np.array(metric['target_q']).mean(),
+            }, step=step)
+            # if self.grad_norm > 0:
+            #     wandb.log({
+            #         'train/actor_grad_norm': actor_grad_norms.max().item(),
+            #         'train/critic_grad_norm': critic_grad_norms.max().item(),
+            #     })
         if self.lr_decay: 
             self.actor_lr_scheduler.step()
             self.critic_lr_scheduler.step()
@@ -193,20 +208,45 @@ class Diffusion_QL(object):
             idx = torch.multinomial(F.softmax(q_value), 1)
         return action[idx].cpu().data.numpy().flatten()
 
-    def save_model(self, dir, id=None):
-        if id is not None:
-            torch.save(self.actor.state_dict(), f'{dir}/actor_{id}.pth')
-            torch.save(self.critic.state_dict(), f'{dir}/critic_{id}.pth')
-        else:
-            torch.save(self.actor.state_dict(), f'{dir}/actor.pth')
-            torch.save(self.critic.state_dict(), f'{dir}/critic.pth')
+    def save(self, folder):
+        os.makedirs(folder, exist_ok=True)
+        def save_attr(name):
+            state_dict = getattr(self, name).state_dict()
+            torch.save(state_dict, f'{folder}/{name}.pth')
 
-    def load_model(self, dir, id=None):
-        if id is not None:
-            self.actor.load_state_dict(torch.load(f'{dir}/actor_{id}.pth'))
-            self.critic.load_state_dict(torch.load(f'{dir}/critic_{id}.pth'))
-        else:
-            self.actor.load_state_dict(torch.load(f'{dir}/actor.pth'))
-            self.critic.load_state_dict(torch.load(f'{dir}/critic.pth'))
+        attrs = ['model', 'actor', 'actor_optimizer', 'ema_model', 'critic', 'critic_target', 'critic_optimizer']
+        if self.lr_decay:
+            attrs.extend(['actor_lr_scheduler', 'critic_lr_scheduler'])
+        for attr in attrs:
+            save_attr(attr)
+
+    def load(self, folder):
+        def load_attr(attr_name):
+            attr = getattr(self, attr_name)
+            attr.load_state_dict(torch.load(f'{folder}/{attr_name}.pth'))
+        attrs = ['model', 'actor', 'actor_optimizer', 'ema_model', 'critic', 'critic_target', 'critic_optimizer']
+        if self.lr_decay:
+            attrs.extend(['actor_lr_scheduler', 'critic_lr_scheduler'])
+        for attr in attrs:
+            load_attr(attr)
+
+
+    # def save_model(self, dir, id=None):
+
+    #     if id is not None:
+    #         torch.save(self.actor.state_dict(), f'{dir}/actor_{id}.pth')
+    #         torch.save(self.actor_optimizer.state_dict(), f'{dir}/actor_optimizer_{id}.pth')
+    #         torch.save(self.critic.state_dict(), f'{dir}/critic_{id}.pth')
+    #     else:
+    #         torch.save(self.actor.state_dict(), f'{dir}/actor.pth')
+    #         torch.save(self.critic.state_dict(), f'{dir}/critic.pth')
+
+    # def load_model(self, dir, id=None):
+    #     if id is not None:
+    #         self.actor.load_state_dict(torch.load(f'{dir}/actor_{id}.pth'))
+    #         self.critic.load_state_dict(torch.load(f'{dir}/critic_{id}.pth'))
+    #     else:
+    #         self.actor.load_state_dict(torch.load(f'{dir}/actor.pth'))
+    #         self.critic.load_state_dict(torch.load(f'{dir}/critic.pth'))
 
 
